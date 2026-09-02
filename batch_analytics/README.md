@@ -114,30 +114,50 @@ and `.hailo/memory/common_pitfalls.md`).
 `zone_counter_offline.py`'s counting logic is ported from `GPUvarient-main`
 (a live, GPU/RTSP retail-analytics system — `core/camera_processor.py`'s
 `AdvancedZoneCounter`/`LineCounter`), not written from scratch. It's a real
-5-state machine (unknown/entering/inside/exiting/outside) with two properties
-the earlier dwell-timer version didn't have:
-- **Baseline occupancy**: whoever is already inside a zone the first time
-  they're observed doesn't fire a spurious entry (and won't fire an exit
-  later either, since they were never "counted").
-- **Spatial/temporal ID re-linking**: a brand-new track_id appearing inside a
-  zone is checked against any recently-departed "open visit" (same zone,
-  still counted, within `zone_id_link_max_sec` and `zone_spatial_match_px`)
-  and treated as a continuation rather than a second entry — this absorbs
-  hailotracker ID switches from occlusion/brief misdetection.
+5-state machine (unknown/entering/inside/exiting/outside) with several
+properties the earlier dwell-timer version didn't have:
+- **Baseline occupancy, but only on the day's very first frame**: whoever is
+  already inside a zone the moment processing starts doesn't fire a spurious
+  entry (there's no video history to say when they actually arrived — could
+  be before the footage even starts). Anywhere else in the day, a track
+  observed already-inside with no matching open visit (see re-linking below)
+  is treated as a genuine new arrival and goes through the normal
+  entry-confirm path instead, so it's counted like any other entry — and its
+  eventual exit is counted too. Applying baseline-occupancy's "don't count
+  it" rule unconditionally (as GPUvarient-main does, having no notion of
+  segmented per-file reprocessing) would silently drop the exit for any
+  visit spanning a segment boundary the re-linking below can't bridge —
+  `in_count` would keep climbing over the day while `out_count` quietly fell
+  behind.
+- **Spatial/temporal ID re-linking, for both zones and lines**: a brand-new
+  track_id appearing inside a zone (or crossing a line with no position
+  history of its own) is checked against any recently-lost track within
+  `zone_id_link_max_sec` and `zone_spatial_match_px`, and treated as a
+  continuation rather than a fresh entry/crossing. This absorbs hailotracker
+  ID switches from occlusion, brief misdetection, or — the case that matters
+  most here — the tracker reset at every segment-file boundary (see "Known
+  limitations" below): without it, a visit or crossing that happens to
+  straddle two segment files would either double-count or (for zones) go
+  uncounted on one side.
+- **A minimum real-movement threshold for line crossings**
+  (`line_min_crossing_px`): a bounding box merely jittering back and forth
+  across the line while someone stands near it doesn't fire a crossing —
+  only a prev→current displacement past this threshold counts as an actual
+  step across.
 
-Adapted for offline use: entry/exit confirmation is time-based (seconds), not
-GPUvarient's raw frame counts — our source footage is VFR and `--analysis-fps`
-can skip frames, so a frame-count threshold would mean a different real-world
-dwell time depending on processing settings. Those seconds are the **video
-feed's own clock** (each segment's filename-derived start time plus the
-current frame's position within it — see `batch_pipeline.py`'s
-`_video_feed_now()`), not wall-clock processing time — this pipeline
-typically runs several times faster than real-time playback (see
-`realtime_factor` below), so measuring dwell/cooldown against wall-clock
-would have made them depend on processing speed instead of how long someone
-actually appears in the footage, exactly the problem switching away from
-frame counts was meant to avoid. Line crossing uses proper
-segment-intersection (CCW test) instead of a side-of-line heuristic.
+Adapted for offline use: entry/exit confirmation and the line-crossing
+cooldown are time-based (seconds), not GPUvarient's raw frame counts — our
+source footage is VFR and `--analysis-fps` can skip frames, so a frame-count
+threshold would mean a different real-world dwell time depending on
+processing settings. Those seconds are the **video feed's own clock** (each
+segment's filename-derived start time plus the current frame's position
+within it — see `batch_pipeline.py`'s `_video_feed_now()`), not wall-clock
+processing time — this pipeline typically runs several times faster than
+real-time playback (see `realtime_factor` below), so measuring dwell/cooldown
+against wall-clock would have made them depend on processing speed instead of
+how long someone actually appears in the footage, exactly the problem
+switching away from frame counts was meant to avoid. Line crossing uses
+proper segment-intersection (CCW test) instead of a side-of-line heuristic.
 Not ported: cross-camera Re-ID, demographics, heatmaps, and anything
 live-stream-specific (placeholder/frozen-frame detection, MQTT, cloud API
 posting) — out of scope for offline single-channel file processing, at least
@@ -195,12 +215,15 @@ of footage takes about 11 minutes to process. To estimate a full day: budget
   fully destroys and recreates the GStreamer pipeline (needed to advance
   `filesrc` to the next file), which also resets `hailotracker`'s state. A
   person present exactly at a segment cut gets a new track ID in the next
-  file. This doesn't affect the timing benchmark or aggregate per-day
-  detection/track counts, but it does mean zone dwell-time and line in/out
-  counts can be off by a small amount right at segment boundaries. If exact
-  cross-boundary accuracy becomes a requirement, this would need a
-  persistent-tracker redesign (e.g. feeding all of a day's frames through
-  one long-lived pipeline instead of per-file pipelines).
+  file. `zone_counter_offline.py`'s spatial/temporal ID re-linking (see
+  above) covers the common case — someone who's roughly where they were
+  (`zone_spatial_match_px`) shortly after (`zone_id_link_max_sec`) gets
+  matched to their pre-cut visit/crossing rather than starting a fresh one —
+  but it's a heuristic, not a guarantee: a real gap in recording, fast
+  motion, or someone else walking through the same spot in that window can
+  still defeat it. If exact cross-boundary accuracy becomes a requirement,
+  this would need a persistent-tracker redesign (e.g. feeding all of a day's
+  frames through one long-lived pipeline instead of per-file pipelines).
 - **Per-file pipeline rebuild overhead is real and included in the numbers**,
   not hidden — each segment boundary reloads the HEF/model, which costs time.
   This is a genuine cost of processing many small segment files rather than

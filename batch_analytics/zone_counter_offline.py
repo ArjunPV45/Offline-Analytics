@@ -25,19 +25,37 @@ What's kept from GPUvarient-main (the actual point of the port):
     hysteresis — a person must stay confirmed-inside before entry counts,
     and confirmed-outside before exit counts (re-entering during EXITING
     cancels the pending exit rather than double-firing).
-  - "Baseline occupancy": a track_id's first observation, if already inside
-    a zone, is recorded as inside WITHOUT firing a spurious entry event —
-    avoids miscounting whoever happens to already be in the zone when
-    processing starts.
+  - "Baseline occupancy": on the very first frame of the whole day's
+    processing only, a track_id already inside a zone is recorded as inside
+    WITHOUT firing a spurious entry event — there's no video history at that
+    point to say when they actually arrived (could easily be before the
+    footage even starts), so it's left uncounted rather than guessed at.
+    Anywhere else in the day, a track observed already-inside with no
+    matching open visit (see re-linking below) is a genuine new arrival and
+    goes through the normal entry-confirm path instead — keeping every
+    counted entry paired with a matching exit. Treating every such case as
+    baseline (as GPUvarient-main does, having no equivalent of segmented
+    per-file reprocessing) would silently drop the exit for anyone whose
+    visit happens to span a segment boundary the re-linking below can't
+    bridge, e.g. after a real gap in recording -- in_count would keep
+    climbing over the day while out_count quietly lagged behind.
   - Spatial/temporal ID re-linking: when a brand-new track_id appears inside
     a zone, and no track_id is already known there, it's matched against any
     recently-seen "open visit" (a track_id that was INSIDE/EXITING and
     counted) within zone_id_link_max_sec and zone_spatial_match_px — the new
     id is treated as a continuation of that visit rather than a fresh entry.
     This absorbs hailotracker ID switches mid-visit (occlusion, brief
-    misdetection) without double-counting.
+    misdetection, or a segment-boundary pipeline rebuild -- see
+    batch_pipeline.py's known limitation on track IDs resetting there)
+    without double-counting. The same matching now also applies to line
+    crossings (see _find_lost_line_track), so a crossing that happens to
+    straddle a segment boundary isn't silently missed just because the
+    tracker handed out a new id for it.
   - Line crossing via proper segment-intersection (CCW test) instead of a
-    side-of-line + displacement-threshold heuristic.
+    side-of-line + displacement-threshold heuristic, plus a minimum
+    real-movement threshold (line_min_crossing_px) so a bounding box merely
+    jittering across the line while someone stands near it doesn't fire a
+    crossing on its own.
 
 Zones/lines are optional. With none configured, `update()` is a no-op and
 `summary()` reports empty zones/lines.
@@ -101,6 +119,9 @@ class _LineState:
     previous_positions: dict[int, tuple[float, float]] = field(default_factory=dict)
     last_seen: dict[int, float] = field(default_factory=dict)
     last_cross_time: dict[int, float] = field(default_factory=dict)
+    # {new_track_id: original_track_id} — active while the original track's
+    # position history is still being retained (see the stale-track sweep)
+    id_aliases: dict[int, int] = field(default_factory=dict)
 
 
 class OfflineZoneLineCounter:
@@ -114,16 +135,28 @@ class OfflineZoneLineCounter:
         zone_id_link_max_sec: float = 8.0,
         zone_stale_track_sec: float = 60.0,
         line_event_cooldown_sec: float = 5.0,
+        line_min_crossing_px: float = 5.0,
     ):
         self.zone_entry_confirm_sec = zone_entry_confirm_sec
         self.zone_exit_confirm_sec = zone_exit_confirm_sec
+        # Also used for line crossing's own id re-linking (_find_lost_line_track)
+        # -- one spatial/temporal tolerance shared by both, since both are
+        # answering the same question ("is this new id really the same
+        # person as that recently-lost one?").
         self.zone_spatial_match_px = zone_spatial_match_px
         self.zone_id_link_max_sec = zone_id_link_max_sec
         self.zone_stale_track_sec = zone_stale_track_sec
         self.line_event_cooldown_sec = line_event_cooldown_sec
+        # A crossing whose prev->current displacement is smaller than this
+        # is treated as bounding-box jitter (someone standing near the line,
+        # or minor detection noise), not a real step across it.
+        self.line_min_crossing_px = line_min_crossing_px
 
         self._zones: dict[str, _ZoneState] = {z.name: _ZoneState(config=z) for z in zones}
         self._lines: dict[str, _LineState] = {l.name: _LineState(config=l) for l in lines}
+        # Set on the very first update() call, then left False for the rest
+        # of the day -- see the UNKNOWN+inside branch of _update_zone.
+        self._is_first_update = True
 
     @property
     def has_zones_or_lines(self) -> bool:
@@ -165,9 +198,11 @@ class OfflineZoneLineCounter:
         if not self._zones and not self._lines:
             return
         now = now if now is not None else time.time()
+        is_first_update = self._is_first_update
+        self._is_first_update = False
         active_ids = {p[0] for p in people}
         for zone_state in self._zones.values():
-            self._update_zone(zone_state, people, active_ids, now)
+            self._update_zone(zone_state, people, active_ids, now, is_first_update)
         for line_state in self._lines.values():
             self._update_line(line_state, people, now)
 
@@ -219,7 +254,7 @@ class OfflineZoneLineCounter:
 
         return best_id
 
-    def _update_zone(self, state: _ZoneState, people, active_ids, now: float) -> None:
+    def _update_zone(self, state: _ZoneState, people, active_ids, now: float, is_first_update: bool) -> None:
         cfg = state.config
         current_feet = {p[0]: self._bottom_center(p) for p in people}
         in_zone_ids = {tid for tid, foot in current_feet.items() if self._is_inside(foot, cfg)}
@@ -288,9 +323,20 @@ class OfflineZoneLineCounter:
 
             if currently_inside:
                 if status["state"] == _UNKNOWN:
-                    # First-ever observation, already inside: baseline
-                    # occupancy, not a fresh entry.
-                    status.update(state=_INSIDE, state_since=now, counted=False)
+                    if is_first_update:
+                        # Very first frame of the whole day: no video history
+                        # exists to say when they arrived (could be before
+                        # the footage even starts) -- baseline occupancy,
+                        # not a fresh entry.
+                        status.update(state=_INSIDE, state_since=now, counted=False)
+                    else:
+                        # A "new" id appearing already inside mid-day (the
+                        # re-linking above found no matching open visit) is a
+                        # genuine unseen arrival, not a startup artifact --
+                        # run it through the normal entry-confirm path so
+                        # it's counted like any other entry, keeping this
+                        # visit's eventual exit symmetric with it.
+                        status.update(state=_ENTERING, state_since=now)
                 elif status["state"] == _OUTSIDE:
                     status.update(state=_ENTERING, state_since=now)
                 elif status["state"] == _ENTERING:
@@ -339,15 +385,56 @@ class OfflineZoneLineCounter:
     def _segments_intersect(cls, a, b, c, d) -> bool:
         return cls._ccw(a, c, d) != cls._ccw(b, c, d) and cls._ccw(a, b, c) != cls._ccw(a, b, d)
 
+    def _find_lost_line_track(
+        self, state: _LineState, new_id: int, new_point: tuple[float, float],
+        current_ids: set[int], now: float, used_old_ids: set[int],
+    ) -> int | None:
+        """Same idea as _find_lost_inside_match, for lines: is this brand-new
+        id really a tracker ID-switch of someone mid-crossing (most often a
+        segment-boundary pipeline rebuild), close to where a recently-seen
+        id was last spotted? If so, its position history carries over so the
+        crossing test below still sees a real prev->current movement instead
+        of starting blind."""
+        best_id, best_dist = None, float("inf")
+        for old_id, old_point in state.previous_positions.items():
+            if old_id == new_id or old_id in current_ids or old_id in used_old_ids:
+                continue
+            gap = now - state.last_seen.get(old_id, -float("inf"))
+            if gap < 0 or gap > self.zone_id_link_max_sec:
+                continue
+            dist = ((new_point[0] - old_point[0]) ** 2 + (new_point[1] - old_point[1]) ** 2) ** 0.5
+            if dist <= self.zone_spatial_match_px and dist < best_dist:
+                best_id, best_dist = old_id, dist
+        return best_id
+
     def _update_line(self, state: _LineState, people, now: float) -> None:
         cfg = state.config
         p1, p2 = cfg.start, cfg.end
+        current_ids = {p[0] for p in people}
+        used_old_ids: set[int] = set()
+
+        # Drop aliases whose original track no longer has any position
+        # history to redirect to (already garbage-collected below).
+        for new_id, old_id in list(state.id_aliases.items()):
+            if old_id not in state.previous_positions:
+                del state.id_aliases[new_id]
 
         for person in people:
-            track_id = person[0]
+            raw_id = person[0]
             current_point = self._bottom_center(person)
-            state.last_seen[track_id] = now
 
+            track_id = state.id_aliases.get(raw_id)
+            if track_id is None and raw_id not in state.previous_positions:
+                old_id = self._find_lost_line_track(state, raw_id, current_point, current_ids, now, used_old_ids)
+                if old_id is not None:
+                    state.id_aliases[raw_id] = old_id
+                    used_old_ids.add(old_id)
+                    track_id = old_id
+                    logger.debug("Line '%s': linked new track %s -> lost track %s", cfg.name, raw_id, old_id)
+            if track_id is None:
+                track_id = raw_id
+
+            state.last_seen[track_id] = now
             prev_point = state.previous_positions.get(track_id)
             state.previous_positions[track_id] = current_point
             if prev_point is None:
@@ -355,6 +442,10 @@ class OfflineZoneLineCounter:
 
             if now - state.last_cross_time.get(track_id, -float("inf")) < self.line_event_cooldown_sec:
                 continue
+
+            displacement = ((current_point[0] - prev_point[0]) ** 2 + (current_point[1] - prev_point[1]) ** 2) ** 0.5
+            if displacement < self.line_min_crossing_px:
+                continue  # bounding-box jitter, not real movement across the line
 
             if not self._segments_intersect(prev_point, current_point, p1, p2):
                 continue
@@ -375,6 +466,9 @@ class OfflineZoneLineCounter:
             state.last_seen.pop(track_id, None)
             state.previous_positions.pop(track_id, None)
             state.last_cross_time.pop(track_id, None)
+        for new_id, old_id in list(state.id_aliases.items()):
+            if old_id not in state.previous_positions:
+                del state.id_aliases[new_id]
 
     def summary(self) -> dict[str, Any]:
         return {
