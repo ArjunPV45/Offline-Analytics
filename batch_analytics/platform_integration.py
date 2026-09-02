@@ -43,9 +43,14 @@ Currently implements:
     POST): triggers batch processing without anyone SSHing in to run
     run_batch_analytics.py by hand -- see job_manager.py. Device-level with
     no channels in the payload processes every channel's full pending
-    backlog; per-channel with a date processes just that one day. Only one
-    job runs at a time (job_manager.py), so this whole pipeline -- discover
-    what's available, configure zones/lines, trigger processing, receive
+    backlog *that the platform has already added via channel_map* (i.e. has
+    a camera_id assigned) -- not every folder on the NFS mount, since a
+    shared archive can hold footage this deployment was never asked to
+    analyze. An explicit channels list overrides this and can name any
+    channel found on disk. Per-channel with a date processes just that one
+    day. Only one job runs at a time (job_manager.py), so this whole
+    pipeline -- discover what's available, decide which cameras actually
+    need analytics, configure zones/lines, trigger processing, receive
     results -- is drivable end to end by the frontend platform talking to
     this one running process.
 
@@ -63,7 +68,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import ssl
 import sys
 from datetime import datetime, timezone
@@ -73,10 +77,10 @@ from typing import Any
 import cv2
 import paho.mqtt.client as mqtt
 import requests
-from dotenv import load_dotenv
 
 from hailo_apps.python.core.common.hailo_logger import get_logger
 
+from batch_analytics import config as cfg
 from batch_analytics.channel_discovery import discover_available_channels
 from batch_analytics.job_manager import BatchJobManager
 from batch_analytics.reference_frame import ReferenceFrameError, find_reference_frame
@@ -85,16 +89,15 @@ from batch_analytics.zone_overlay_render import draw_zones_on_frame
 from batch_analytics.zone_payload_normalize import normalize_line, normalize_zone
 
 logger = get_logger(__name__)
-load_dotenv()
 
-DEFAULT_VIDEOS_ROOT = os.getenv("VIDEOS_ROOT", "/home/hailopi/Analytics/Videos")
 # Matches run_batch_analytics.py's own default --output-dir, resolved the
 # same way (relative to wherever this is run from -- normally
 # UrbanRAIN_COUNTER-main/). Must point at the same place run_batch_analytics.py
 # actually writes reports to, or "already processed" filtering silently does
 # nothing.
-DEFAULT_REPORTS_DIR = os.getenv("BATCH_REPORTS_DIR", "batch_reports")
-CAMERA_ID_MAP_PATH = Path(__file__).parent / "channel_camera_ids.json"
+DEFAULT_VIDEOS_ROOT = cfg.VIDEOS_ROOT
+DEFAULT_REPORTS_DIR = cfg.BATCH_REPORTS_DIR
+CAMERA_ID_MAP_PATH = cfg.CAMERA_ID_MAP_PATH
 
 # Matches draw_zone.py's defaults -- a snapshot for a channel with no zone
 # config yet gets resized to this, so it's the same resolution the platform
@@ -298,17 +301,17 @@ class PlatformController:
         zone_line_config_api_url: str | None = None,
         process_status_api_url: str | None = None,
     ):
-        self.pi_id = pi_id or os.getenv("PI_UNIQUE_ID")
+        self.pi_id = pi_id or cfg.PI_UNIQUE_ID
         self.videos_root = videos_root
         self.reports_dir = reports_dir
-        self.broker_url = broker_url or os.getenv("MQTT_BROKER_URL")
-        self.broker_port = int(broker_port or os.getenv("MQTT_BROKER_PORT", 8883))
-        self.username = username or os.getenv("MQTT_USERNAME")
-        self.password = password or os.getenv("MQTT_PASSWORD")
-        self.channels_api_url = channels_api_url or os.getenv("CHANNELS_API_URL")
-        self.snapshot_api_url = snapshot_api_url or os.getenv("SNAPSHOT_API_URL")
-        self.zone_line_config_api_url = zone_line_config_api_url or os.getenv("ZONE_LINE_CONFIG_API_URL")
-        self.process_status_api_url = process_status_api_url or os.getenv("PROCESS_STATUS_API_URL")
+        self.broker_url = broker_url or cfg.MQTT_BROKER_URL
+        self.broker_port = int(broker_port or cfg.MQTT_BROKER_PORT)
+        self.username = username or cfg.MQTT_USERNAME
+        self.password = password or cfg.MQTT_PASSWORD
+        self.channels_api_url = channels_api_url or cfg.CHANNELS_API_URL
+        self.snapshot_api_url = snapshot_api_url or cfg.SNAPSHOT_API_URL
+        self.zone_line_config_api_url = zone_line_config_api_url or cfg.ZONE_LINE_CONFIG_API_URL
+        self.process_status_api_url = process_status_api_url or cfg.PROCESS_STATUS_API_URL
         self.camera_id_map = load_camera_id_map()
         self.job_manager = BatchJobManager(
             videos_root=str(self.videos_root),
@@ -460,15 +463,23 @@ class PlatformController:
 
     def _handle_process_request(self, request_payload: dict[str, Any]) -> None:
         """Device-level process_request: process the full pending backlog for
-        the given channels, or every channel that currently has pending days
-        if none were named."""
+        the given channels, or -- if none were named -- every channel the
+        platform has already added via channel_map (has a camera_id
+        assigned) that currently has pending days. This is deliberately
+        narrower than "every channel found on the NFS mount": a shared
+        archive can hold footage for cameras this deployment was never
+        asked to analyze, and channel_map is how the platform opts a
+        channel in. An explicit `channels` list always overrides this and
+        can name any channel found on disk, mapped or not.
+        """
         channels = request_payload.get("channels")
         if not channels:
-            channels = [
+            pending = {
                 c["channel"] for c in discover_available_channels(
                     self.videos_root, self.camera_id_map, self.reports_dir,
                 ) if c["days"]
-            ]
+            }
+            channels = [c for c in self.camera_id_map if c in pending]
         if not channels:
             self._push_process_ack({"status": "nothing_to_process", "channels": []})
             return

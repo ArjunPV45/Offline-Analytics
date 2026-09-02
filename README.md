@@ -84,9 +84,18 @@ Copy `.env.example` to `.env` and fill in real values:
 |---|---|
 | `PI_UNIQUE_ID` | This device's identity on the MQTT broker |
 | `MQTT_BROKER_URL` / `_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker connection |
-| `VIDEOS_ROOT` | Root of the recorded-footage archive (`<channel>/<date>/*.mp4`) |
+| `VIDEOS_ROOT` | Root of the recorded-footage archive (`<channel>/<date>/*.mp4`) — the one setting basically guaranteed to differ between devices |
 | `BATCH_REPORTS_DIR` | Where per-day JSON reports are written (default `batch_reports/`) |
-| `CHANNELS_API_URL`, `SNAPSHOT_API_URL`, `ZONE_LINE_CONFIG_API_URL`, `PROCESSED_DAY_API_URL` | HTTP endpoints the batch pipeline POSTs responses to |
+| `HAILO_ARCH`, `HEF_PATH` | This device's Hailo chip and which compiled model to run — leave blank for hailo-apps' own auto-detected defaults |
+| `DEFAULT_ANALYSIS_FPS` | Default frame-skipping rate for batch runs — leave blank to analyze every frame |
+| `CHANNELS_API_URL`, `SNAPSHOT_API_URL`, `ZONE_LINE_CONFIG_API_URL`, `PROCESSED_DAY_API_URL`, `PROCESS_STATUS_API_URL` | HTTP endpoints the batch pipeline POSTs responses to |
+
+Every one of these is read in exactly one place, [`batch_analytics/config.py`](batch_analytics/config.py)
+— every script imports its settings from there rather than hardcoding a
+default, so a new device (different footage path, different Hailo chip or
+model) only ever needs `.env` edited, never the code. See
+[`batch_analytics/README.md`](batch_analytics/README.md#plug-and-play-device-setup)
+for details.
 
 See [`batch_analytics/MQTT_API.md`](batch_analytics/MQTT_API.md) for the full
 request/response contract if you're integrating a frontend platform.
@@ -130,10 +139,10 @@ a request the frontend platform sends over MQTT (full contract in
 | Platform sends | Device does |
 |---|---|
 | `channels_request` | Reports which channels/days it has footage for on the NFS mount |
-| `channel_map` | Assigns (or clears) a channel's numeric `camera_id` — no more hand-editing `channel_camera_ids.json` after every deployment |
+| `channel_map` | Assigns (or clears) a channel's numeric `camera_id` — also **opts that channel in** for automatic processing (see `process_request` below) — no more hand-editing `channel_camera_ids.json` after every deployment |
 | `snapshot_request` | Sends a reference frame (with any existing zones/lines drawn on it) |
 | `zone_config` / `line_config` | Saves zone/line coordinates drawn on that frame |
-| `process_request` | Runs batch analytics — one channel/day, one channel's whole backlog, several named channels, or every channel with pending work |
+| `process_request` | Runs batch analytics — one channel/day, one channel's whole backlog, several named channels, or (with no channels named) every channel already added via `channel_map` — a shared NFS archive can hold footage for cameras this device was never asked to analyze, so only explicitly-added channels are processed automatically |
 
 Results (and `process_request`'s started/busy/finished status) get POSTed
 back out over HTTP as they happen. `Restart=always` in the unit file means a
@@ -154,6 +163,7 @@ not in memory.
 │   ├── batch_pipeline.py         # GStreamer app: multi-file sequential processing
 │   ├── zone_counter_offline.py   # Time-based zone/line counting for batch footage
 │   ├── platform_integration.py   # MQTT-in / HTTP-out controller
+│   ├── config.py                 # .env-driven settings, single source of truth
 │   ├── day_completion.py         # Safety checks for video deletion (see below)
 │   ├── video_catalog.py, channel_discovery.py, reference_frame.py,
 │   │   zone_config_io.py, zone_overlay_render.py, zone_payload_normalize.py,

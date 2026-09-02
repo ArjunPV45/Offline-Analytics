@@ -204,18 +204,23 @@ is already running comes back with `"status": "busy"` instead of starting a
 second one — retry later, or watch for the running job's `finished`/`failed`
 ack.
 
-**Device-level — process everything (or a specific set of channels):**
+**Device-level — process everything added, or a specific set of channels:**
 
 **Request topic (MQTT):** `vision/<pi_id>/process_request`
 **Request payload (optional):**
 ```json
 { "channels": ["ch01", "ch02"] }
 ```
-Omit `channels` (or send `{}`) to process every channel that currently has
-pending (unprocessed) days — same set `channels_request` would return.
-Each named channel's **full pending backlog** is processed, day by day,
-sequentially (`run_batch_analytics_all_days.py` under the hood) — not just
-the most recent day.
+Omit `channels` (or send `{}`) to process every channel **the platform has
+already added via `channel_map`** (i.e. has a `camera_id` assigned) that
+currently has pending days — deliberately narrower than "every folder on the
+NFS mount": a shared archive can hold footage for cameras this device was
+never asked to analyze, and `channel_map` is how the platform opts a channel
+in. Pass an explicit `channels` list to process any channel found on disk,
+mapped or not — an explicit list always overrides the "only added channels"
+default. Each named channel's **full pending backlog** is processed, day by
+day, sequentially (`run_batch_analytics_all_days.py` under the hood) — not
+just the most recent day.
 
 **Per-channel — process one channel's backlog, or a single specific day:**
 

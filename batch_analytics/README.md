@@ -14,6 +14,28 @@ camera/day at a time, with no live RTSP streams involved. It has its own MQTT
 integration for the frontend platform — see below — since "what's available
 to process" is a different question than "what live cameras are connected."
 
+## Plug-and-play device setup
+
+Every device-specific setting lives in `.env` (see `.env.example`) and is
+read in exactly one place, `config.py` — every script and module that needs
+one of these imports it from there instead of hardcoding its own default.
+Setting up a new device should only ever mean "edit `.env`," never "edit a
+script":
+
+| `.env` variable | Controls |
+|---|---|
+| `VIDEOS_ROOT` | Where this device's NFS-mounted (or symlinked) footage archive is — the one setting basically guaranteed to differ between devices |
+| `BATCH_REPORTS_DIR` | Where per-day JSON reports land |
+| `HAILO_ARCH` | This device's Hailo chip (`hailo8` / `hailo8l`) — same `--arch` flag `get_pipeline_parser()` accepts; leave blank for hailo-apps' own auto-detection |
+| `HEF_PATH` | Which compiled model (`.hef`) to run inference with — leave blank for hailo-apps' own default for the detected arch |
+| `DEFAULT_ANALYSIS_FPS` | Default frame-skipping rate (see `--analysis-fps` under "Usage" below) — leave blank to analyze every frame |
+
+`HAILO_ARCH`/`HEF_PATH` apply automatically to every `run_batch_analytics.py`
+run (manual or `process_request`-triggered, via `job_manager.py`) unless
+`--arch`/`--hef-path` are passed explicitly on that one invocation, which
+always wins. This means swapping to a different Hailo device or a
+custom-trained model is a one-line `.env` edit, not a code change.
+
 ## Usage
 
 ```bash
@@ -152,6 +174,9 @@ of footage takes about 11 minutes to process. To estimate a full day: budget
 - `job_manager.py` — runs `run_batch_analytics.py`/`run_batch_analytics_all_days.py`
   as a background subprocess on behalf of `platform_integration.py`'s
   `process_request` handlers, one job at a time system-wide.
+- `config.py` — every device-specific setting (footage location, Hailo
+  arch/model, MQTT/HTTP endpoints), read once from `.env` and imported
+  everywhere else needs it. See "Plug-and-play device setup" below.
 
 ## Known limitations
 
@@ -240,8 +265,12 @@ Summary of what's implemented:
   one running process, without anyone SSHing in to run
   `run_batch_analytics.py`/`run_batch_analytics_all_days.py` by hand. A
   device-level request with no `channels` in the payload processes every
-  channel's full pending backlog; a per-channel request processes just that
-  channel's backlog, or a single `date` if given. Only **one job runs at a
+  channel the platform has already **added via `channel_map`** (has a
+  `camera_id` assigned) that has pending days -- not every folder on the NFS
+  mount, since a shared archive can hold footage this deployment was never
+  asked to analyze; pass an explicit `channels` list to target any channel
+  found on disk regardless of mapping. A per-channel request processes just
+  that channel's backlog, or a single `date` if given. Only **one job runs at a
   time** system-wide — `job_manager.py` shells out to
   `run_batch_analytics.py` (single day) or `run_batch_analytics_all_days.py`
   (a channel's, or several channels', full backlog) as a background

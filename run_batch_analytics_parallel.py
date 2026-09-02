@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-DEFAULT_OUTPUT_DIR = "batch_reports"
+from batch_analytics import config as cfg
 
 
 def _stream_output(channel: str, pipe, log_file) -> None:
@@ -51,7 +51,7 @@ def main() -> int:
     )
     parser.add_argument("--date", required=True)
     parser.add_argument("--videos-root", default=None)
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", default=cfg.BATCH_REPORTS_DIR)
     parser.add_argument(
         "--display",
         action="store_true",

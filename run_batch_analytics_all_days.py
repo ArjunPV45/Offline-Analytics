@@ -40,8 +40,7 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_VIDEOS_ROOT = "/home/hailopi/Analytics/Videos"
-DEFAULT_OUTPUT_DIR = "batch_reports"
+from batch_analytics import config as cfg
 
 
 def main() -> int:
@@ -51,14 +50,17 @@ def main() -> int:
         help="Repeat for multiple channels, e.g. --channel ch01 --channel ch02. "
              "Channels (and their days) are processed one at a time, in order.",
     )
-    parser.add_argument("--videos-root", default=DEFAULT_VIDEOS_ROOT)
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--videos-root", default=cfg.VIDEOS_ROOT)
+    parser.add_argument("--output-dir", default=cfg.BATCH_REPORTS_DIR)
     parser.add_argument(
         "--reprocess", action="store_true",
         help="Reprocess days that already have a report (default: skip them).",
     )
     parser.add_argument("--display", action="store_true", help="Passed through to each day's run.")
-    parser.add_argument("--analysis-fps", type=float, default=None, help="Passed through to each day's run.")
+    parser.add_argument(
+        "--analysis-fps", type=float, default=cfg.DEFAULT_ANALYSIS_FPS,
+        help="Passed through to each day's run. Defaults to DEFAULT_ANALYSIS_FPS from .env.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)

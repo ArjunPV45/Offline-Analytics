@@ -6,8 +6,13 @@ Usage:
     python3 run_batch_analytics.py --channel ch03 --date 2026-08-17 \\
         --videos-root /home/hailopi/Analytics/Videos --output-dir batch_reports
 
-Any additional flags accepted by get_pipeline_parser() (e.g. --arch, --hef-path,
---show-fps) may be appended and are passed straight through to the pipeline.
+--videos-root/--output-dir/--analysis-fps default to VIDEOS_ROOT/BATCH_REPORTS_DIR/
+DEFAULT_ANALYSIS_FPS from .env (see batch_analytics/config.py) if not passed
+explicitly. --arch/--hef-path likewise default to this device's configured
+HAILO_ARCH/HEF_PATH -- pass either explicitly to override just this run.
+
+Any additional flags accepted by get_pipeline_parser() (e.g. --show-fps) may
+be appended and are passed straight through to the pipeline.
 """
 
 import argparse
@@ -16,8 +21,8 @@ from pathlib import Path
 
 from hailo_apps.python.core.common.core import get_pipeline_parser
 
+from batch_analytics import config as cfg
 from batch_analytics.batch_pipeline import (
-    DEFAULT_ANALYSIS_FPS,
     BatchAppCallback,
     BatchDetectionApp,
     app_callback,
@@ -26,16 +31,13 @@ from batch_analytics.video_catalog import discover_day
 from batch_analytics.zone_config_io import default_zone_config_path, load_zone_config
 from batch_analytics.zone_counter_offline import OfflineZoneLineCounter
 
-DEFAULT_VIDEOS_ROOT = "/home/hailopi/Analytics/Videos"
-DEFAULT_OUTPUT_DIR = "batch_reports"
-
 
 def main() -> int:
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--channel", required=True, help="Camera channel folder, e.g. ch01")
     pre_parser.add_argument("--date", required=True, help="Date folder, e.g. 2026-08-17")
-    pre_parser.add_argument("--videos-root", default=DEFAULT_VIDEOS_ROOT)
-    pre_parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    pre_parser.add_argument("--videos-root", default=cfg.VIDEOS_ROOT)
+    pre_parser.add_argument("--output-dir", default=cfg.BATCH_REPORTS_DIR)
     pre_parser.add_argument(
         "--display",
         action="store_true",
@@ -48,7 +50,7 @@ def main() -> int:
     pre_parser.add_argument(
         "--analysis-fps",
         type=float,
-        default=DEFAULT_ANALYSIS_FPS,
+        default=cfg.DEFAULT_ANALYSIS_FPS,
         help=(
             "Only analyze roughly this many frames per second, dropping the "
             "rest before scaling/inference/tracking/overlay to cut processing "
@@ -116,6 +118,16 @@ def main() -> int:
         elif pre_args.zone_config:
             print(f"ERROR: zone config not found: {zone_config_path}", file=sys.stderr)
             return 1
+
+    # Apply this device's configured --arch/--hef-path (see .env's
+    # HAILO_ARCH/HEF_PATH) unless the caller already passed their own --
+    # an explicit flag on the command line always wins over the device
+    # default, same convention as --width/--height above.
+    user_set_model = any(flag in remaining_argv for flag in ("--arch", "--hef-path"))
+    if user_set_model:
+        print("NOTE: --arch/--hef-path passed explicitly -- ignoring HAILO_ARCH/HEF_PATH from .env", file=sys.stderr)
+    else:
+        remaining_argv = remaining_argv + cfg.extra_pipeline_args()
 
     # Rewrite sys.argv so the framework's own parser (invoked inside
     # BatchDetectionApp/GStreamerApp) sees only flags it understands, plus the
