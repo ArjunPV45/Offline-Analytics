@@ -62,19 +62,46 @@ DEFAULT_ANALYSIS_FPS: float | None = None
 
 
 class BatchAppCallback(app_callback_class):
-    """Per-frame state, reset at the start of every segment file."""
+    """Per-frame state, reset at the start of every segment file.
 
-    def __init__(self, counter: OfflineZoneLineCounter):
+    `segment_start_epoch` is the current segment's real recording start time
+    (Unix epoch seconds, from its filename -- see video_catalog.py), used
+    together with each buffer's PTS to compute the video-feed timestamp a
+    frame actually shows (see app_callback / _video_feed_now below) instead
+    of wall-clock processing time, which runs at whatever speed this batch
+    job happens to go and has no fixed relationship to the footage's own
+    timeline.
+    """
+
+    def __init__(self, counter: OfflineZoneLineCounter, segment_start_epoch: float):
         super().__init__()
         self.counter = counter
+        self.segment_start_epoch = segment_start_epoch
         self.file_frames = 0
         self.file_detections = 0
         self.file_track_ids: set[int] = set()
 
-    def reset_file_stats(self) -> None:
+    def reset_file_stats(self, segment_start_epoch: float | None = None) -> None:
         self.file_frames = 0
         self.file_detections = 0
         self.file_track_ids = set()
+        if segment_start_epoch is not None:
+            self.segment_start_epoch = segment_start_epoch
+
+
+def _video_feed_now(buffer, user_data: BatchAppCallback) -> float:
+    """The real-world clock time this frame actually shows: the current
+    segment's filename-derived start time plus this buffer's position within
+    it -- not time.time(), which would be whenever this batch job happens to
+    process the frame (this pipeline typically runs several times faster
+    than real-time playback, and can run hours or days after the footage was
+    recorded). This is what feeds the zone/line counter's dwell-time and
+    crossing-cooldown timers so they measure real video-content seconds
+    regardless of processing speed. Falls back to time.time() if the buffer
+    has no valid PTS (rare)."""
+    if buffer.pts == Gst.CLOCK_TIME_NONE:
+        return time.time()
+    return user_data.segment_start_epoch + (buffer.pts / Gst.SECOND)
 
 
 def app_callback(element, buffer, user_data: BatchAppCallback):
@@ -111,7 +138,7 @@ def app_callback(element, buffer, user_data: BatchAppCallback):
 
     user_data.file_frames += 1
     user_data.file_detections += detection_count
-    user_data.counter.update(people)
+    user_data.counter.update(people, now=_video_feed_now(buffer, user_data))
 
     _add_zone_overlays(roi, user_data.counter, width, height)
 
@@ -338,7 +365,7 @@ class BatchDetectionApp(GStreamerDetectionApp):
             next_segment = self._pending_segments.pop(0)
             self._current_segment = next_segment
             self.video_source = str(next_segment.path)
-            self.user_data.reset_file_stats()
+            self.user_data.reset_file_stats(segment_start_epoch=next_segment.start_dt.timestamp())
             self._file_start_wall = time.time()
             logger.info("Advancing to next segment: %s", next_segment.path.name)
             GLib.idle_add(self._rebuild_pipeline)

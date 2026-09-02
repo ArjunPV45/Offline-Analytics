@@ -128,7 +128,15 @@ the earlier dwell-timer version didn't have:
 Adapted for offline use: entry/exit confirmation is time-based (seconds), not
 GPUvarient's raw frame counts — our source footage is VFR and `--analysis-fps`
 can skip frames, so a frame-count threshold would mean a different real-world
-dwell time depending on processing settings. Line crossing uses proper
+dwell time depending on processing settings. Those seconds are the **video
+feed's own clock** (each segment's filename-derived start time plus the
+current frame's position within it — see `batch_pipeline.py`'s
+`_video_feed_now()`), not wall-clock processing time — this pipeline
+typically runs several times faster than real-time playback (see
+`realtime_factor` below), so measuring dwell/cooldown against wall-clock
+would have made them depend on processing speed instead of how long someone
+actually appears in the footage, exactly the problem switching away from
+frame counts was meant to avoid. Line crossing uses proper
 segment-intersection (CCW test) instead of a side-of-line heuristic.
 Not ported: cross-camera Re-ID, demographics, heatmaps, and anything
 live-stream-specific (placeholder/frozen-frame detection, MQTT, cloud API

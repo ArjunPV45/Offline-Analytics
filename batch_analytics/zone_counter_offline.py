@@ -154,6 +154,14 @@ class OfflineZoneLineCounter:
         return shapes
 
     def update(self, people: set[PersonObservation], now: float | None = None) -> None:
+        """`now` should be the video-feed's own clock (the real time this
+        frame's content shows -- see batch_pipeline.py's _video_feed_now()),
+        not wall-clock processing time. All the dwell-time/cooldown
+        thresholds above are measured against `now`, so if it doesn't track
+        the footage's real timeline, they end up measuring processing speed
+        instead of how long someone actually appeared in the video. Defaults
+        to time.time() only for callers with no video timeline of their own
+        (e.g. ad hoc/interactive use)."""
         if not self._zones and not self._lines:
             return
         now = now if now is not None else time.time()

@@ -138,7 +138,7 @@ def main() -> int:
     pipeline_parser = get_pipeline_parser()
 
     counter = OfflineZoneLineCounter(zones=zones, lines=lines)
-    user_data = BatchAppCallback(counter)
+    user_data = BatchAppCallback(counter, segment_start_epoch=first_segment.start_dt.timestamp())
 
     app = BatchDetectionApp(
         app_callback,
