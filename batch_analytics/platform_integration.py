@@ -13,9 +13,15 @@ Currently implements:
   - channels_request (MQTT in) -> channels response (HTTP POST): the
     frontend asks what's available to process, this Pi answers with
     channels + their day folders (not individual files — see
-    channel_discovery.py). Offline equivalent of the live app's
-    push_cameras/push_cameras_response — no dynamic camera_add/camera_remove
-    here, channels are fixed by what's actually on disk.
+    channel_discovery.py). Channels themselves are fixed by what's actually
+    on disk (no dynamic camera_add/camera_remove, unlike the live app) — but
+    which numeric camera_id each one reports is remotely assignable, see
+    channel_map below.
+  - channel_map (MQTT in) -> channels response (HTTP POST): assigns (or
+    clears) the numeric camera_id a channel folder reports in channels
+    responses, persisted to channel_camera_ids.json. Lets the frontend
+    finish wiring up a channel entirely remotely instead of someone SSHing
+    in to hand-edit that file after every deployment.
   - snapshot_request (MQTT in, per channel) -> snapshot response (HTTP
     POST): sends a reference frame from that channel's saved footage,
     **with any already-configured zones/lines drawn on it** (yellow
@@ -33,6 +39,15 @@ Currently implements:
     reused. A zone_config message replaces all zones for that channel (not
     a merge) but leaves that channel's lines untouched, and vice versa for
     line_config — matching the live system's replace-not-append convention.
+  - process_request (MQTT in, device-level or per-channel) -> ack (HTTP
+    POST): triggers batch processing without anyone SSHing in to run
+    run_batch_analytics.py by hand -- see job_manager.py. Device-level with
+    no channels in the payload processes every channel's full pending
+    backlog; per-channel with a date processes just that one day. Only one
+    job runs at a time (job_manager.py), so this whole pipeline -- discover
+    what's available, configure zones/lines, trigger processing, receive
+    results -- is drivable end to end by the frontend platform talking to
+    this one running process.
 
 Per-day event pushing (batch_pipeline.py pushes each day's report once
 processing finishes, via day_result_push.py) is implemented separately, not
@@ -63,6 +78,7 @@ from dotenv import load_dotenv
 from hailo_apps.python.core.common.hailo_logger import get_logger
 
 from batch_analytics.channel_discovery import discover_available_channels
+from batch_analytics.job_manager import BatchJobManager
 from batch_analytics.reference_frame import ReferenceFrameError, find_reference_frame
 from batch_analytics.zone_config_io import default_zone_config_path, load_zone_config, save_zone_config
 from batch_analytics.zone_overlay_render import draw_zones_on_frame
@@ -101,6 +117,43 @@ def load_camera_id_map(path: Path = CAMERA_ID_MAP_PATH) -> dict[str, int]:
     with open(path) as f:
         data = json.load(f)
     return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def save_camera_id_map(camera_id_map: dict[str, int], path: Path = CAMERA_ID_MAP_PATH) -> None:
+    payload = {
+        "_comment": (
+            "Maps channel folder names to the numeric camera_id the frontend "
+            "expects. Managed remotely via the channel_map MQTT action (see "
+            "MQTT_API.md) -- a direct edit here survives until the next "
+            "channel_map message, which overwrites the whole file."
+        ),
+        **camera_id_map,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def apply_channel_map(camera_id_map: dict[str, int], payload: dict[str, Any]) -> dict[str, Any]:
+    """Mutates `camera_id_map` in place with the channel(s) named in `payload`,
+    persists the result to channel_camera_ids.json, and returns a summary of
+    what changed. Accepts a single `{"channel": ..., "camera_id": ...}` pair,
+    a bulk `{"mapping": {"ch01": 123, ...}}` dict, or both at once. A null
+    `camera_id` removes that channel's mapping (falls back to reporting
+    camera_id: null, same as a channel that was never mapped).
+    """
+    updates: dict[str, int | None] = dict(payload.get("mapping") or {})
+    if payload.get("channel") is not None:
+        updates[payload["channel"]] = payload.get("camera_id")
+
+    for channel, camera_id in updates.items():
+        if camera_id is None:
+            camera_id_map.pop(channel, None)
+        else:
+            camera_id_map[channel] = int(camera_id)
+
+    save_camera_id_map(camera_id_map)
+    logger.info("Updated channel/camera_id mapping: %s", updates)
+    return {"updated": updates}
 
 
 def build_channels_response(
@@ -243,6 +296,7 @@ class PlatformController:
         channels_api_url: str | None = None,
         snapshot_api_url: str | None = None,
         zone_line_config_api_url: str | None = None,
+        process_status_api_url: str | None = None,
     ):
         self.pi_id = pi_id or os.getenv("PI_UNIQUE_ID")
         self.videos_root = videos_root
@@ -254,7 +308,13 @@ class PlatformController:
         self.channels_api_url = channels_api_url or os.getenv("CHANNELS_API_URL")
         self.snapshot_api_url = snapshot_api_url or os.getenv("SNAPSHOT_API_URL")
         self.zone_line_config_api_url = zone_line_config_api_url or os.getenv("ZONE_LINE_CONFIG_API_URL")
+        self.process_status_api_url = process_status_api_url or os.getenv("PROCESS_STATUS_API_URL")
         self.camera_id_map = load_camera_id_map()
+        self.job_manager = BatchJobManager(
+            videos_root=str(self.videos_root),
+            reports_dir=str(self.reports_dir),
+            on_job_finished=self._handle_job_finished,
+        )
 
         missing = [
             name for name, value in [
@@ -273,6 +333,7 @@ class PlatformController:
             ("channels_api_url", "CHANNELS_API_URL", "channels_request"),
             ("snapshot_api_url", "SNAPSHOT_API_URL", "snapshot_request"),
             ("zone_line_config_api_url", "ZONE_LINE_CONFIG_API_URL", "zone_config/line_config"),
+            ("process_status_api_url", "PROCESS_STATUS_API_URL", "process_request"),
         ]:
             if not getattr(self, url_attr):
                 logger.warning("%s not set -- %s will be received but the response can't be pushed anywhere", env_name, action)
@@ -296,16 +357,23 @@ class PlatformController:
             return
         logger.info("Connected to MQTT broker as pi_id=%s", self.pi_id)
         client.subscribe(f"vision/{self.pi_id}/channels_request")
+        client.subscribe(f"vision/{self.pi_id}/channel_map")
+        client.subscribe(f"vision/{self.pi_id}/process_request")
         client.subscribe(f"vision/{self.pi_id}/+/snapshot_request")
         client.subscribe(f"vision/{self.pi_id}/+/zone_config")
         client.subscribe(f"vision/{self.pi_id}/+/line_config")
-        logger.info("Subscribed to channels_request and per-channel snapshot_request/zone_config/line_config")
+        client.subscribe(f"vision/{self.pi_id}/+/process_request")
+        logger.info(
+            "Subscribed to channels_request, channel_map, process_request, and "
+            "per-channel snapshot_request/zone_config/line_config/process_request"
+        )
 
     # action name (last topic segment) -> handler(channel, payload)
     _CHANNEL_ACTION_HANDLERS = {
         "snapshot_request": "_handle_snapshot_request",
         "zone_config": "_handle_zone_config",
         "line_config": "_handle_line_config",
+        "process_request": "_handle_channel_process_request",
     }
 
     def _on_message(self, client, userdata, msg) -> None:
@@ -314,6 +382,14 @@ class PlatformController:
 
         if msg.topic == f"vision/{self.pi_id}/channels_request":
             self._handle_channels_request()
+            return
+
+        if msg.topic == f"vision/{self.pi_id}/process_request":
+            self._handle_process_request(self._parse_json_payload(msg.payload))
+            return
+
+        if msg.topic == f"vision/{self.pi_id}/channel_map":
+            self._handle_channel_map(self._parse_json_payload(msg.payload))
             return
 
         if len(topic_parts) == 4 and topic_parts[:2] == ["vision", self.pi_id]:
@@ -347,6 +423,14 @@ class PlatformController:
         payload = build_channels_response(self.pi_id, self.videos_root, self.camera_id_map, self.reports_dir)
         self._push_json(self.channels_api_url, payload, "channels response")
 
+    def _handle_channel_map(self, request_payload: dict[str, Any]) -> None:
+        apply_channel_map(self.camera_id_map, request_payload)
+        if not self.channels_api_url:
+            logger.error("channel_map applied locally, but CHANNELS_API_URL is not configured -- updated channels response can't be pushed")
+            return
+        payload = build_channels_response(self.pi_id, self.videos_root, self.camera_id_map, self.reports_dir)
+        self._push_json(self.channels_api_url, payload, "channels response (after channel_map)")
+
     def _handle_snapshot_request(self, channel: str, request_payload: dict[str, Any]) -> None:
         if not self.snapshot_api_url:
             logger.error("snapshot_request for '%s' received but SNAPSHOT_API_URL is not configured -- dropping", channel)
@@ -373,6 +457,48 @@ class PlatformController:
     def _handle_line_config(self, channel: str, request_payload: dict[str, Any]) -> None:
         ack = apply_line_config(channel, request_payload)
         self._push_config_ack(channel, "line_config", ack)
+
+    def _handle_process_request(self, request_payload: dict[str, Any]) -> None:
+        """Device-level process_request: process the full pending backlog for
+        the given channels, or every channel that currently has pending days
+        if none were named."""
+        channels = request_payload.get("channels")
+        if not channels:
+            channels = [
+                c["channel"] for c in discover_available_channels(
+                    self.videos_root, self.camera_id_map, self.reports_dir,
+                ) if c["days"]
+            ]
+        if not channels:
+            self._push_process_ack({"status": "nothing_to_process", "channels": []})
+            return
+        self._submit_job(channels, date=None)
+
+    def _handle_channel_process_request(self, channel: str, request_payload: dict[str, Any]) -> None:
+        """Per-channel process_request: a specific day if given, otherwise
+        that one channel's full pending backlog."""
+        date = request_payload.get("date")
+        self._submit_job([channel], date=date)
+
+    def _submit_job(self, channels: list[str], date: str | None) -> None:
+        result = self.job_manager.submit(channels, date=date)
+        logger.info("process_request for %s (date=%s): %s", channels, date, result["status"])
+        self._push_process_ack(result)
+
+    def _handle_job_finished(self, job: dict[str, Any], returncode: int) -> None:
+        self._push_process_ack({
+            "status": "finished" if returncode == 0 else "failed",
+            "channels": job["channels"],
+            "date": job["date"],
+            "exit_code": returncode,
+        })
+
+    def _push_process_ack(self, ack: dict[str, Any]) -> None:
+        if not self.process_status_api_url:
+            logger.error("process_request status (%s) not pushed -- PROCESS_STATUS_API_URL is not configured", ack.get("status"))
+            return
+        payload = {"pi_id": self.pi_id, "action": "process_request", "generated_at": _now_iso(), **ack}
+        self._push_json(self.process_status_api_url, payload, "process_request status")
 
     def _push_config_ack(self, channel: str, action: str, ack: dict[str, Any]) -> None:
         if not self.zone_line_config_api_url:

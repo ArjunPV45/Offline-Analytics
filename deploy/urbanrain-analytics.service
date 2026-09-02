@@ -1,0 +1,42 @@
+# systemd unit for the offline batch analytics platform controller.
+#
+# Runs `python3 -m batch_analytics.platform_integration` continuously. Once
+# this is running, nothing about day-to-day operation needs manual
+# intervention on the device -- channel discovery/mapping, zone/line
+# configuration, and triggering batch processing all happen purely in
+# response to MQTT requests from the frontend platform (see
+# batch_analytics/MQTT_API.md). A crash just restarts it; it re-subscribes
+# and picks back up on the next request.
+#
+# Edit User/WorkingDirectory/ExecStart below first if this repo, or the
+# hailo-apps venv it depends on, aren't at the paths assumed here -- see the
+# main README's "Installing on a fresh Pi + Hailo device" section for the
+# sibling-directory layout these paths assume.
+#
+# Install:
+#   sudo ./deploy/install_service.sh
+#   sudo systemctl start urbanrain-analytics
+#   sudo systemctl status urbanrain-analytics
+#   sudo journalctl -u urbanrain-analytics -f
+
+[Unit]
+Description=UrbanRAIN offline batch analytics -- platform controller (MQTT in / HTTP out)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+# If VIDEOS_ROOT (see .env) is an NFS mount, uncomment so this waits for it
+# to actually be mounted before starting (path must match VIDEOS_ROOT):
+# RequiresMountsFor=/home/hailopi/Analytics/Videos
+
+[Service]
+Type=simple
+User=hailopi
+WorkingDirectory=/home/hailopi/urbanrain-counter
+EnvironmentFile=/home/hailopi/urbanrain-counter/.env
+ExecStart=/home/hailopi/hailo-apps/venv_hailo_apps/bin/python3 -m batch_analytics.platform_integration
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

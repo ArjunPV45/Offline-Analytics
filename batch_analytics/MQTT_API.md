@@ -56,10 +56,37 @@ Publish to ask what channels and days of footage this device has.
 
 Field notes:
 - `channel` — the stable identifier (`ch01`, `ch02`, ...). Use this for every other request to this device, not `camera_id`.
-- `camera_id` — **may be `null`** if this channel isn't mapped to a numeric ID yet on the backend. Handle `null` gracefully.
-- `days` — `YYYY-MM-DD` strings. **Only days not yet processed by this device** — once a day's analytics finishes (and its report is pushed, see §4 below), that date drops out of this list on the next `channels_request`. A channel with zero remaining unprocessed days is omitted from `channels` entirely.
+- `camera_id` — **may be `null`** if this channel isn't mapped to a numeric ID yet on the backend. Handle `null` gracefully, or assign one with `channel_map` below.
+- `days` — `YYYY-MM-DD` strings. **Only days not yet processed by this device** — once a day's analytics finishes (and its report is pushed, see §5 below), that date drops out of this list on the next `channels_request`. A channel with zero remaining unprocessed days is omitted from `channels` entirely.
 
-### 2. `snapshot_request` (per channel) → snapshot response
+### 2. `channel_map` → channels response
+
+Assign (or clear) the numeric `camera_id` a channel reports in `channels_request`
+responses — remotely, instead of someone SSHing in to hand-edit
+`channel_camera_ids.json` after every deployment. Channels themselves are
+never created or removed this way (they're fixed by what's actually on the
+NFS mount) — this only attaches/detaches the numeric ID the backend already
+uses for that channel.
+
+**Request topic (MQTT):** `vision/<pi_id>/channel_map`
+**Request payload — single channel:**
+```json
+{ "channel": "ch01", "camera_id": 174899 }
+```
+**Request payload — bulk (any number of channels in one message):**
+```json
+{ "mapping": { "ch01": 174899, "ch02": 174900 } }
+```
+`channel`/`camera_id` and `mapping` can be combined in one message; a `null`
+`camera_id` clears that channel's mapping (it goes back to reporting
+`camera_id: null`).
+
+**Response:** the same **channels response** shape as `channels_request`
+(§1 above — reused rather than inventing a separate ack schema), reflecting
+the mapping immediately after applying it, HTTP POSTed to the channels
+endpoint.
+
+### 3. `snapshot_request` (per channel) → snapshot response
 
 Ask for a reference frame from a specific channel — e.g. to show what a camera sees, or as the base image for drawing zones/lines.
 
@@ -89,7 +116,7 @@ Omit `date` for the most recent day available. `segment_index` picks which segme
 
 **Important**: if this channel already has zones/lines configured, the image comes back **with them already drawn on it** (yellow rectangles for zones, cyan lines for lines, each labeled) — not a blank frame. `width`/`height` are the actual dimensions of the returned image — a subsequent `zone_config`/`line_config` for this channel must draw against *these* dimensions (see below).
 
-### 3. `zone_config` / `line_config` (per channel) → ack
+### 4. `zone_config` / `line_config` (per channel) → ack
 
 Send zone/line coordinates (e.g. drawn on the snapshot above) for this device to save and use when processing that channel.
 
@@ -140,7 +167,7 @@ Notes:
 ```
 (`line_config` responses look the same with `action: "line_config"` and the `zone_count`/`line_count` roles swapped as the "count I just set" / "count that was already there, untouched.")
 
-### 4. Processed-day results (no request — pushed automatically)
+### 5. Processed-day results (no request — pushed automatically)
 
 Not MQTT-triggered: once this device finishes processing a channel/day
 (`run_batch_analytics.py`), it automatically HTTP POSTs that day's full
@@ -166,6 +193,70 @@ finds out a channel/day is done and what the results were.
 }
 ```
 `zones`/`lines` are whole-day in/out totals, not individual timestamped visit events (that's the "planned" item below).
+
+### 6. `process_request` (device-level or per-channel) → status ack
+
+Triggers batch processing remotely — no one needs to SSH in and run
+`run_batch_analytics.py` by hand. Only **one job runs at a time** on this
+device (concurrent Hailo pipeline runs are unstable on this hardware — see
+`batch_analytics/README.md`); a `process_request` that arrives while a job
+is already running comes back with `"status": "busy"` instead of starting a
+second one — retry later, or watch for the running job's `finished`/`failed`
+ack.
+
+**Device-level — process everything (or a specific set of channels):**
+
+**Request topic (MQTT):** `vision/<pi_id>/process_request`
+**Request payload (optional):**
+```json
+{ "channels": ["ch01", "ch02"] }
+```
+Omit `channels` (or send `{}`) to process every channel that currently has
+pending (unprocessed) days — same set `channels_request` would return.
+Each named channel's **full pending backlog** is processed, day by day,
+sequentially (`run_batch_analytics_all_days.py` under the hood) — not just
+the most recent day.
+
+**Per-channel — process one channel's backlog, or a single specific day:**
+
+**Request topic (MQTT):** `vision/<pi_id>/<channel>/process_request`
+**Request payload (optional):**
+```json
+{ "date": "2026-08-17" }
+```
+Omit `date` to process that one channel's full pending backlog. With `date`,
+only that specific day is processed (even if already-processed — a repeat
+request just reruns it).
+
+**Response:** HTTP POST to the process-status endpoint, once when the job
+starts (or is rejected as busy) and again when it finishes:
+```json
+{
+  "pi_id": "<pi_id>",
+  "action": "process_request",
+  "status": "started",
+  "channels": ["ch01", "ch02"],
+  "date": null,
+  "pid": 48213,
+  "generated_at": "2026-09-01T12:00:00.000Z"
+}
+```
+```json
+{
+  "pi_id": "<pi_id>",
+  "action": "process_request",
+  "status": "finished",
+  "channels": ["ch01", "ch02"],
+  "date": null,
+  "exit_code": 0,
+  "generated_at": "2026-09-01T13:42:11.000Z"
+}
+```
+`status` is one of `started`, `busy`, `nothing_to_process` (device-level
+request with no pending days for any channel), `finished`, or `failed`
+(non-zero exit code). This ack is a job-lifecycle signal only — each day's
+actual results still arrive separately via the processed-day-results push
+(§5) as that day completes, same as if the job had been started by hand.
 
 ---
 

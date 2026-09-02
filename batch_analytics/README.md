@@ -149,6 +149,9 @@ of footage takes about 11 minutes to process. To estimate a full day: budget
   network calls removed (that module POSTs every event to a live production
   API — unsuitable for reprocessing historical footage) and scoped to one
   camera per run.
+- `job_manager.py` — runs `run_batch_analytics.py`/`run_batch_analytics_all_days.py`
+  as a background subprocess on behalf of `platform_integration.py`'s
+  `process_request` handlers, one job at a time system-wide.
 
 ## Known limitations
 
@@ -203,6 +206,13 @@ Summary of what's implemented:
   to process drops out of the response entirely. This is a cheap
   existence check on the report file, not a strict correctness check —
   it does not verify every video file in the folder was actually covered.
+- **`channel_map`** → channels response: assigns (or clears) a channel's
+  numeric `camera_id`, persisted to `channel_camera_ids.json` (single
+  `{"channel": ..., "camera_id": ...}` or bulk `{"mapping": {...}}` payload
+  — see `apply_channel_map()`). Lets the platform finish wiring up every
+  channel remotely instead of someone SSHing in to hand-edit that file
+  after each deployment; the response is the same channels-response shape
+  `channels_request` returns, reflecting the change immediately.
 - **`snapshot_request`** (per channel, addressed by **channel name** like
   `ch01`, not a numeric camera_id — camera_id isn't guaranteed to exist for
   every channel) → snapshot response: a reference frame from that channel's
@@ -223,6 +233,26 @@ Summary of what's implemented:
   its stored resolution is protected: a follow-up message with a different
   `width`/`height` is ignored (logged as a warning) rather than silently
   misaligning the zones/lines that were already saved.
+- **`process_request`** (device-level, or per-channel addressed by channel
+  name) → status ack: triggers batch processing remotely (`job_manager.py`),
+  so the frontend can drive the whole pipeline — discover what's available,
+  configure zones/lines, trigger processing, receive results — through this
+  one running process, without anyone SSHing in to run
+  `run_batch_analytics.py`/`run_batch_analytics_all_days.py` by hand. A
+  device-level request with no `channels` in the payload processes every
+  channel's full pending backlog; a per-channel request processes just that
+  channel's backlog, or a single `date` if given. Only **one job runs at a
+  time** system-wide — `job_manager.py` shells out to
+  `run_batch_analytics.py` (single day) or `run_batch_analytics_all_days.py`
+  (a channel's, or several channels', full backlog) as a background
+  subprocess, the same way `run_batch_analytics_parallel.py` already does,
+  and rejects a new request as `"busy"` rather than queuing or running a
+  second job concurrently — concurrent Hailo pipeline runs are the
+  documented instability risk (see "Usage" above), and a platform-triggered
+  job has no operator watching it to notice trouble. Each day's actual
+  results still arrive the normal way (the processed-day-results push,
+  below) as that day completes — the process_request ack only reports
+  whether the job started, is busy, or has finished/failed.
 - **Processed-day results** (not MQTT-triggered): once
   `run_batch_analytics.py` finishes a channel/day, it automatically pushes
   that day's full report (`day_result_push.py`, called from
@@ -237,12 +267,19 @@ cp batch_analytics/channel_camera_ids.example.json batch_analytics/channel_camer
 # edit channel_camera_ids.json with the real numeric camera_id per channel
 python3 -m batch_analytics.platform_integration
 ```
+This one long-running command is the whole automation loop: it discovers
+channels, serves snapshots, saves zone/line config, and now also launches
+`run_batch_analytics.py`/`run_batch_analytics_all_days.py` on
+`process_request` — the manual CLI scripts under "Usage" above still work
+standalone for local runs/debugging, but production operation only needs
+this one process running and reacting to the frontend platform.
+
 `camera_id` is `null` for any channel missing from `channel_camera_ids.json`
 — expected, not an error, until every channel is mapped. Any of
 `CHANNELS_API_URL`/`SNAPSHOT_API_URL`/`ZONE_LINE_CONFIG_API_URL`/
-`PROCESSED_DAY_API_URL` unset behaves the same way: the request/event is
-still received and logged, the response just can't be pushed anywhere until
-that URL is configured.
+`PROCESSED_DAY_API_URL`/`PROCESS_STATUS_API_URL` unset behaves the same way:
+the request/event is still received and logged, the response just can't be
+pushed anywhere until that URL is configured.
 
 Not yet implemented (deliberately deferred, needs further scoping before
 building): per-event pushing (individual timestamped entry/exit/line-crossing

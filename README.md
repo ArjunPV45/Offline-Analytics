@@ -5,8 +5,12 @@ batch mode:
 
 - **Offline batch** (`batch_analytics/`) — reprocesses **already-recorded** `.mp4`
   footage (e.g. an NFS-mounted CCTV archive, one channel/day at a time), applying
-  zone/line counting logic, and can push results and take zone/line
-  configuration from a frontend platform over MQTT + HTTP.
+  zone/line counting logic. Runs as one long-lived service
+  (`batch_analytics/platform_integration.py`, see "Production deployment"
+  below) fully driven by a frontend platform over MQTT + HTTP: channel
+  discovery, camera ID mapping, zone/line configuration, and triggering the
+  actual processing all happen as platform requests, with results and job
+  status pushed back out automatically.
 
 ---
 
@@ -90,7 +94,53 @@ request/response contract if you're integrating a frontend platform.
 `batch_analytics/zone_configs/*.json` and `batch_analytics/channel_camera_ids.json`
 are runtime state, gitignored on purpose — they hold this specific
 deployment's camera/zone layout, not code, and are created the first time you
-draw a zone or add a camera.
+draw a zone or add a camera (or the platform sends a `zone_config`/`channel_map`
+message — see below).
+
+---
+
+## Production deployment (systemd)
+
+The intended production setup for a device is: clone this repo, fill in
+`.env`, mount the NFS footage archive, install the systemd service, and then
+walk away — everything from that point on happens because the frontend
+platform asked for it, over MQTT, not because someone is SSHed into the
+device.
+
+```bash
+# 1. Mount (or symlink) the NFS-hosted footage archive at VIDEOS_ROOT,
+#    however this device normally does that -- e.g. an /etc/fstab entry:
+#    nfs-server:/export/Analytics/Videos  /home/hailopi/Analytics/Videos  nfs  defaults,_netdev  0  0
+
+# 2. Install and enable the service (edit deploy/urbanrain-analytics.service's
+#    User/WorkingDirectory/ExecStart first if this repo or the hailo-apps venv
+#    aren't at the paths it assumes -- see "Installing on a fresh Pi + Hailo
+#    device" above for that layout)
+sudo ./deploy/install_service.sh
+sudo systemctl start urbanrain-analytics
+sudo systemctl status urbanrain-analytics
+sudo journalctl -u urbanrain-analytics -f     # follow logs
+```
+
+From here, the running service (`python3 -m batch_analytics.platform_integration`)
+is the only thing that needs to be running on the device. Everything else is
+a request the frontend platform sends over MQTT (full contract in
+[`batch_analytics/MQTT_API.md`](batch_analytics/MQTT_API.md)):
+
+| Platform sends | Device does |
+|---|---|
+| `channels_request` | Reports which channels/days it has footage for on the NFS mount |
+| `channel_map` | Assigns (or clears) a channel's numeric `camera_id` — no more hand-editing `channel_camera_ids.json` after every deployment |
+| `snapshot_request` | Sends a reference frame (with any existing zones/lines drawn on it) |
+| `zone_config` / `line_config` | Saves zone/line coordinates drawn on that frame |
+| `process_request` | Runs batch analytics — one channel/day, one channel's whole backlog, several named channels, or every channel with pending work |
+
+Results (and `process_request`'s started/busy/finished status) get POSTed
+back out over HTTP as they happen. `Restart=always` in the unit file means a
+crash just restarts the controller, which re-subscribes and picks back up on
+the next request — no state is lost, since everything it acts on (zone/line
+config, camera ID mapping, which days are already processed) lives on disk,
+not in memory.
 
 ---
 
@@ -107,7 +157,7 @@ draw a zone or add a camera.
 │   ├── day_completion.py         # Safety checks for video deletion (see below)
 │   ├── video_catalog.py, channel_discovery.py, reference_frame.py,
 │   │   zone_config_io.py, zone_overlay_render.py, zone_payload_normalize.py,
-│   │   day_result_push.py        # Supporting modules
+│   │   day_result_push.py, job_manager.py  # Supporting modules
 │   └── zone_configs/              # Per-channel zone/line layouts (gitignored)
 ├── run_batch_analytics.py       # Process one channel/day
 ├── run_batch_analytics_parallel.py  # Process multiple channels concurrently
@@ -117,6 +167,10 @@ draw a zone or add a camera.
 ├── batch_reports/                 # Per-day JSON output (gitignored)
 │
 ├── cpu_benchmark/                # Standalone CPU-only (no Hailo) inference speed test
+│
+├── deploy/                       # Production deployment (see above)
+│   ├── urbanrain-analytics.service  # systemd unit for platform_integration.py
+│   └── install_service.sh           # Installs/enables the unit above
 │
 ├── resources/                    # Postprocess .so libs + .hef models (gitignored, fetched by download_resources.sh)
 ├── install.sh, download_resources.sh, setup_env.sh
@@ -144,13 +198,18 @@ python3 run_batch_analytics_all_days.py --channel ch01 --channel ch02 --channel 
 Full details, including `--analysis-fps` frame-skipping and zone/line config
 format, are in [`batch_analytics/README.md`](batch_analytics/README.md).
 
-**Frontend platform integration** (MQTT requests in, HTTP responses out —
-channel discovery, remote zone/line drawing, processed-day results):
+**Frontend platform integration** — the single long-running command that
+drives the whole pipeline from platform requests (MQTT requests in, HTTP
+responses out): channel discovery, remote zone/line drawing, **triggering
+processing** (`process_request`, no manual `run_batch_analytics*.py`
+invocation needed), and processed-day results:
 ```bash
 python3 -m batch_analytics.platform_integration
 ```
 See [`batch_analytics/MQTT_API.md`](batch_analytics/MQTT_API.md) for the full
-topic/payload reference.
+topic/payload reference. The `run_batch_analytics*.py` scripts above still
+work standalone for local runs/debugging, but production use only needs this
+one process running.
 
 **Deleting processed footage** (manual, dry-run by default, 4-day safety grace
 period, refuses to touch a day if any file wasn't covered by its report):
