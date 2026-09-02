@@ -1,0 +1,40 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv*/
+.pytest_cache/
+
+# Logs
+*.log
+logs/
+analytics_logs/
+
+# Live-app runtime state (regenerated on the device, site-specific -- not code)
+pi_status.json
+cameras.json
+cameras_zones.json
+zone_line_config.json
+line_totals.json
+live_test_counts.json
+persistent_ids.json
+*.jsonl
+
+# Hailo proprietary/compiled binaries (fetched by download_resources.sh, not source)
+resources/*.so
+resources/*.hef
+
+# Pretrained weights (auto-downloaded by ultralytics on first run, see cpu_benchmark/README.md)
+cpu_benchmark/*.pt
+
+# Batch analytics: real site data and per-deployment config -- not code.
+# Directory structure is kept via .gitkeep; contents are generated at runtime.
+batch_reports/*
+!batch_reports/.gitkeep
+batch_analytics/zone_configs/*.json
+!batch_analytics/zone_configs/.gitkeep
+batch_analytics/channel_camera_ids.json
+batch_analytics/deletion_audit.log

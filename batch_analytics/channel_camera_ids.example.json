@@ -1,0 +1,6 @@
+{
+  "_comment": "Maps our channel folder names to the numeric camera_id the frontend/backend already uses (matching the old cameras.json convention). Copy this file to channel_camera_ids.json and fill in real values -- channels without an entry here still work, they just report camera_id: null until mapped.",
+  "ch01": 0,
+  "ch02": 0,
+  "ch03": 0
+}
