@@ -1,9 +1,9 @@
 # Offline Analytics — Platform API (for frontend integration)
 
 This is the contract for the **offline batch analytics** pipeline (processes
-saved CCTV footage, not live RTSP). It's a separate device identity from the
-live system (`../../GPUvarient-main`, `../main.py`) — don't assume they
-share `pi_id` or behavior.
+saved CCTV footage, not live RTSP). It's a separate device identity from any
+live RTSP system (e.g. `../../GPUvarient-main`) — don't assume they share
+`pi_id` or behavior.
 
 **Requests go IN over MQTT. Responses come OUT over HTTP**, not MQTT — a
 response can carry a sizeable base64-encoded image, which doesn't belong on

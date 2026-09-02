@@ -8,14 +8,11 @@ one camera in a day (or faster)?"
 
 ## Why this exists
 
-The live app (`../main.py`, `../zone_counter.py`, `../inference_engine.py`)
-processes RTSP streams in real time and pushes zone/line events to MQTT and a
-production analytics API. This is a different job: reprocessing already-saved
-`.mp4` files from `/home/hailopi/Analytics/Videos/<channel>/<date>/` (an NFS
-mount), one camera/day at a time, with no live RTSP streams involved. It does
-now have its own MQTT integration for the frontend platform — see below —
-separate from the live app's, since "what's available to process" is a
-different question than "what live cameras are connected."
+This pipeline reprocesses already-saved `.mp4` files from
+`/home/hailopi/Analytics/Videos/<channel>/<date>/` (an NFS mount), one
+camera/day at a time, with no live RTSP streams involved. It has its own MQTT
+integration for the frontend platform — see below — since "what's available
+to process" is a different question than "what live cameras are connected."
 
 ## Usage
 

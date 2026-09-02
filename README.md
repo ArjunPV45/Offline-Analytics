@@ -1,18 +1,12 @@
 # Zone Visitor Counter (Hailo + Raspberry Pi)
 
-Zone/line-crossing visitor counting on **Raspberry Pi + Hailo-8/8L**, in two modes:
+Zone/line-crossing visitor counting on **Raspberry Pi + Hailo-8/8L**, offline
+batch mode:
 
-- **Live** (`main.py` and friends) — pulls RTSP camera streams in real time, counts
-  people crossing configured zones/lines, and streams results out over MQTT plus a
-  small Flask/SocketIO status API.
 - **Offline batch** (`batch_analytics/`) — reprocesses **already-recorded** `.mp4`
-  footage (e.g. an NFS-mounted CCTV archive, one channel/day at a time), applying the
-  same zone/line counting logic, and can push results and take zone/line
+  footage (e.g. an NFS-mounted CCTV archive, one channel/day at a time), applying
+  zone/line counting logic, and can push results and take zone/line
   configuration from a frontend platform over MQTT + HTTP.
-
-Both modes share the same Hailo device, the same `.env` device identity, and (for
-zone/line coordinates) the same visual conventions — but they are otherwise
-independent and can be deployed/run separately.
 
 ---
 
@@ -22,8 +16,7 @@ independent and can be deployed/run separately.
 |---|---|
 | Compute | Raspberry Pi 5 (or equivalent aarch64 SBC) |
 | AI accelerator | Hailo-8 or Hailo-8L, connected via M.2/PCIe |
-| Camera (live mode) | Any RTSP-capable IP camera |
-| Footage source (batch mode) | Pre-recorded `.mp4` files, named `chNN_YYYYMMDDTHHMMSS_HHMMSS.mp4`, one folder per channel per day (`<channel>/<YYYY-MM-DD>/`) — e.g. an NFS-mounted recorder archive |
+| Footage source | Pre-recorded `.mp4` files, named `chNN_YYYYMMDDTHHMMSS_HHMMSS.mp4`, one folder per channel per day (`<channel>/<YYYY-MM-DD>/`) — e.g. an NFS-mounted recorder archive |
 
 ## Software prerequisites
 
@@ -66,7 +59,7 @@ git clone <this-repo-url> urbanrain-counter
 cd urbanrain-counter
 pip install -r requirements.txt
 
-# 4. Fetch the HEF models this project's live pipeline uses
+# 4. Fetch the HEF models the batch pipeline uses
 export DEVICE_ARCHITECTURE=HAILO8L   # or HAILO8 -- hailo-apps' setup_env.sh
                                       # doesn't set this legacy variable itself,
                                       # unlike download_resources.sh below expects
@@ -77,34 +70,25 @@ cp .env.example .env
 # edit .env with real values (see Configuration below)
 ```
 
-**Known caveat, not yet verified on this hardware**: `requirements.txt` pins
-`numpy<2.0.0`, inherited from when this project was first written; the
-`hailo-apps` framework itself now runs on numpy 2.x. If you install both into
-the same venv, check for a numpy conflict before relying on the **live**
-subsystem (`main.py` + `norfair`/`Flask-SocketIO`/`eventlet`) — only the
-**offline batch** subsystem has been exercised end-to-end against numpy 2.x
-so far.
-
 ---
 
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in real values:
 
-| Variable | Used by | Purpose |
-|---|---|---|
-| `PI_UNIQUE_ID` | both | This device's identity on the MQTT broker |
-| `MQTT_BROKER_URL` / `_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` | both | Broker connection |
-| `VIDEOS_ROOT` | batch | Root of the recorded-footage archive (`<channel>/<date>/*.mp4`) |
-| `BATCH_REPORTS_DIR` | batch | Where per-day JSON reports are written (default `batch_reports/`) |
-| `CHANNELS_API_URL`, `SNAPSHOT_API_URL`, `ZONE_LINE_CONFIG_API_URL`, `PROCESSED_DAY_API_URL` | batch | HTTP endpoints the batch pipeline POSTs responses to |
+| Variable | Purpose |
+|---|---|
+| `PI_UNIQUE_ID` | This device's identity on the MQTT broker |
+| `MQTT_BROKER_URL` / `_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker connection |
+| `VIDEOS_ROOT` | Root of the recorded-footage archive (`<channel>/<date>/*.mp4`) |
+| `BATCH_REPORTS_DIR` | Where per-day JSON reports are written (default `batch_reports/`) |
+| `CHANNELS_API_URL`, `SNAPSHOT_API_URL`, `ZONE_LINE_CONFIG_API_URL`, `PROCESSED_DAY_API_URL` | HTTP endpoints the batch pipeline POSTs responses to |
 
 See [`batch_analytics/MQTT_API.md`](batch_analytics/MQTT_API.md) for the full
 request/response contract if you're integrating a frontend platform.
 
-`cameras.json`, `zone_line_config.json`, `cameras_zones.json`,
-`batch_analytics/zone_configs/*.json`, and `batch_analytics/channel_camera_ids.json`
-are all runtime state, gitignored on purpose — they hold this specific
+`batch_analytics/zone_configs/*.json` and `batch_analytics/channel_camera_ids.json`
+are runtime state, gitignored on purpose — they hold this specific
 deployment's camera/zone layout, not code, and are created the first time you
 draw a zone or add a camera.
 
@@ -114,20 +98,6 @@ draw a zone or add a camera.
 
 ```
 .
-├── main.py                    # Live mode entry point (RTSP -> Hailo -> zone counting -> MQTT)
-├── command_listener.py        # MQTT command handling for the live app
-├── zone_counter.py             # Live zone/line counting state machine
-├── gstreamer_pipeline.py       # Live GStreamer pipeline construction
-├── video_stream.py             # RTSP stream handling
-├── tracker_manager.py          # Object tracking (norfair) for the live app
-├── inference_engine.py         # Hailo inference wrapper for the live app
-├── web_routes.py                # Flask/SocketIO status API
-├── health_monitor.py, pi_status_monitor.py, stability_monitor.py
-│                                # Device/process health monitoring
-├── camera_persistence.py, config.py, logging_config.py, rtsp_utils.py,
-│   analytics_poster.py, status_poster.py, frame_producer.py
-│                                # Live-app support modules
-│
 ├── batch_analytics/            # Offline batch pipeline (see its own README)
 │   ├── README.md                # Full internal documentation
 │   ├── MQTT_API.md               # Frontend integration contract (copy-paste ready)
@@ -149,20 +119,13 @@ draw a zone or add a camera.
 ├── cpu_benchmark/                # Standalone CPU-only (no Hailo) inference speed test
 │
 ├── resources/                    # Postprocess .so libs + .hef models (gitignored, fetched by download_resources.sh)
-├── deploy.sh, install.sh, download_resources.sh, setup_env.sh
+├── install.sh, download_resources.sh, setup_env.sh
 └── .env.example
 ```
 
 ---
 
 ## Usage
-
-**Live mode:**
-```bash
-python3 main.py
-```
-Cameras are added/removed and zones/lines are configured via MQTT commands (see
-`command_listener.py`); state persists to `cameras.json`/`zone_line_config.json`.
 
 **Offline batch mode:**
 ```bash

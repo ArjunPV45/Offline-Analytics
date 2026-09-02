@@ -13,14 +13,6 @@ venv*/
 logs/
 analytics_logs/
 
-# Live-app runtime state (regenerated on the device, site-specific -- not code)
-pi_status.json
-cameras.json
-cameras_zones.json
-zone_line_config.json
-line_totals.json
-live_test_counts.json
-persistent_ids.json
 *.jsonl
 
 # Hailo proprietary/compiled binaries (fetched by download_resources.sh, not source)

@@ -2,8 +2,7 @@
 
 Built on the official hailo_apps GStreamer framework (SOURCE_PIPELINE,
 INFERENCE_PIPELINE_WRAPPER, TRACKER_PIPELINE) rather than a hand-rolled
-appsrc/hailonet pipeline — see the live app's inference_engine.py for the
-old approach this replaces for saved-file processing.
+appsrc/hailonet pipeline.
 
 Multi-file sequencing: GStreamerApp.on_eos() normally *loops the same file*
 forever when the source is a file (see gstreamer_app.py's on_eos/_rebuild_pipeline).

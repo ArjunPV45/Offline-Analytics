@@ -1,7 +1,7 @@
 """MQTT-in, HTTP-out integration between this offline batch pipeline and the
-frontend platform — the offline-processing counterpart to the live app's
-MQTT control channel (see ../command_listener.py, ../GPUvarient-main/main.py,
-../GPUvarient-main/MQTT_COMMANDS.md for the live conventions this mirrors).
+frontend platform — the offline-processing counterpart to a live app's MQTT
+control channel (see ../GPUvarient-main/main.py, ../GPUvarient-main/MQTT_COMMANDS.md
+for the live conventions this mirrors).
 
 Requests come in over MQTT (lightweight, broker-mediated commands); this
 Pi's *responses* go out as HTTP POSTs to the platform's own API, not MQTT
